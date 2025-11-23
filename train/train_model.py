@@ -1,59 +1,93 @@
+import argparse
 from pyspark.sql import SparkSession
+from pyspark.ml import Pipeline
 from pyspark.ml.feature import VectorAssembler, StringIndexer
 from pyspark.ml.classification import RandomForestClassifier
-from pyspark.ml import Pipeline
 from pyspark.ml.evaluation import MulticlassClassificationEvaluator
-import sys
 
-def main():
-    if len(sys.argv) != 4:
-        print("Usage: train_model.py <training_csv> <validation_csv> <model_output_path>")
-        sys.exit(1)
 
-    training_path = sys.argv[1]
-    validation_path = sys.argv[2]
-    model_output_path = sys.argv[3]
+def get_spark(app_name: str = "WineQualityTraining"):
+    return (
+        SparkSession.builder
+        .appName(app_name)
+        .getOrCreate()
+    )
 
-    spark = SparkSession.builder.appName("WineQualityTraining").getOrCreate()
 
-    # Read CSVs
-    train_df = spark.read.csv(training_path, header=True, sep=';', inferSchema=True)
-    val_df = spark.read.csv(validation_path, header=True, sep=';', inferSchema=True)
+def load_dataset(spark, path: str):
+    # CSVs are ; separated with header row
+    return (
+        spark.read
+        .option("header", "true")
+        .option("sep", ";")
+        .option("inferSchema", "true")
+        .csv(path)
+    )
 
-    # Features
-    feature_cols = [c for c in train_df.columns if c != "quality"]
 
-    assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
+def build_pipeline(feature_cols, label_col="quality"):
+    indexer = StringIndexer(
+        inputCol=label_col,
+        outputCol="label",
+        handleInvalid="keep"
+    )
 
-    label_indexer = StringIndexer(inputCol="quality", outputCol="label")
+    assembler = VectorAssembler(
+        inputCols=feature_cols,
+        outputCol="features"
+    )
 
-    # Model
-    model = RandomForestClassifier(featuresCol="features", labelCol="label", numTrees=50)
+    rf = RandomForestClassifier(
+        labelCol="label",
+        featuresCol="features",
+        numTrees=100,
+        maxDepth=10
+    )
 
-    # Pipeline
-    pipeline = Pipeline(stages=[label_indexer, assembler, model])
+    return Pipeline(stages=[indexer, assembler, rf])
 
-    # Train
-    trained_model = pipeline.fit(train_df)
 
-    # Evaluate on validation
-    predictions = trained_model.transform(val_df)
+def main(args):
+    spark = get_spark()
+
+    print(f"Reading training data from: {args.training_path}")
+    train_df = load_dataset(spark, args.training_path)
+
+    print(f"Reading validation data from: {args.validation_path}")
+    val_df = load_dataset(spark, args.validation_path)
+
+    label_col = "quality"
+    feature_cols = [c for c in train_df.columns if c != label_col]
+
+    pipeline = build_pipeline(feature_cols, label_col)
+
+    print("Training model...")
+    model = pipeline.fit(train_df)
+
+    print("Evaluating on validation set...")
+    predictions = model.transform(val_df)
 
     evaluator = MulticlassClassificationEvaluator(
         labelCol="label",
         predictionCol="prediction",
         metricName="f1"
     )
-
     f1 = evaluator.evaluate(predictions)
-    print(f"Validation F1 Score: {f1}")
+    print(f"Validation F1 score: {f1}")
 
-    # Save model
-    trained_model.write().overwrite().save(model_output_path)
+    print(f"Saving model to: {args.model_output_path}")
+    model.write().overwrite().save(args.model_output_path)
 
     spark.stop()
+    print("Done.")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Train wine-quality model with Spark.")
+    parser.add_argument("training_path", help="Path to TrainingDataset.csv (local path or S3 URI).")
+    parser.add_argument("validation_path", help="Path to ValidationDataset.csv (local path or S3 URI).")
+    parser.add_argument("model_output_path", help="Output path to save the trained model (local dir or S3 URI).")
+
+    args = parser.parse_args()
+    main(args)
 
